@@ -15,1265 +15,768 @@ body {
   -webkit-user-select: none;
   user-select: none;
 }
-canvas {
-  display: block;
-  width: 100vw;
-  height: 100vh;
-}
+canvas { display: block; width: 100vw; height: 100vh; }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
 <script>
 // ============================================================
-//  ECHO STEP — HTML5 Build
+//  ECHO STEP — HTML5 Build (clean rewrite)
 //  One button. Every step answers.
 // ============================================================
-
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
 // --- Constants ---
-const GRAVITY = 1800;
-const MIN_JUMP = 420;
-const MAX_JUMP = 1050;
-const MAX_CHARGE_TIME = 1.0;
-const JUMP_ANGLE = 62 * Math.PI / 180;
-const ECHO_REPLAY_DELAY = 2.0;
-const ECHO_LIFETIME = 10.0;
-const ECHO_SINK_SPEED = 18;
-const ECHO_BOOST = 450;
-const SHOCKWAVE_LAUNCH = 1100;
-const SHOCKWAVE_RADIUS = 80;
-const SHOCKWAVE_DURATION = 0.4;
-const PLAYER_W = 28;
-const PLAYER_H = 36;
-const ECHO_W = 28;
-const ECHO_H = 36;
+const GRAVITY      = 1800;
+const MIN_JUMP     = 420;
+const MAX_JUMP     = 1050;
+const MAX_CHARGE   = 1.0;
+const JUMP_ANGLE   = 62 * Math.PI / 180;
+const ECHO_DELAY   = 2.0;
+const ECHO_LIFE    = 10.0;
+const ECHO_SINK    = 18;
+const ECHO_BOOST   = 450;
+const SW_LAUNCH    = 1100;
+const SW_RADIUS    = 80;
+const SW_DUR       = 0.4;
+const PW = 28, PH = 36;   // player size
+const EW = 28, EH = 36;   // echo size
+const SKIN = 3;            // ground-check tolerance
 
 // --- Resize ---
-function resize() {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-}
-window.addEventListener('resize', resize);
-resize();
+function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
 
-// --- Input ---
-let inputDown = false;
-let inputJustUp = false;
-let inputDownTime = 0;        // timestamp when button went down
-const TAP_THRESHOLD = 0.15;   // seconds — shorter than this = tap to flip direction
-let inputIsTap = false;       // set on release if hold was short
+// --- Input (simple: track held duration) ---
+let inp = { down: false, justUp: false, tap: false, downT: 0 };
+const TAP_MS = 150;
+let ignoreUntil = 0; // input blackout after screen transitions
 
-function onDown(e) { e.preventDefault(); inputDown = true; inputDownTime = performance.now() / 1000; }
-function onUp(e) {
-  e.preventDefault();
-  let held = performance.now() / 1000 - inputDownTime;
-  inputDown = false;
-  inputJustUp = true;  // always set — update loop decides if it's a tap or jump
-  if (held < TAP_THRESHOLD) {
-    inputIsTap = true;
-  }
+function inpDown() { inp.down = true; inp.downT = performance.now(); }
+function inpUp() {
+  let held = performance.now() - inp.downT;
+  inp.down = false;
+  inp.justUp = true;
+  if (held < TAP_MS) inp.tap = true;
 }
 
-window.addEventListener('mousedown', onDown);
-window.addEventListener('mouseup', onUp);
-window.addEventListener('touchstart', onDown, { passive: false });
-window.addEventListener('touchend', onUp, { passive: false });
-window.addEventListener('keydown', e => {
-  if (e.code === 'Space') { e.preventDefault(); inputDown = true; inputDownTime = performance.now() / 1000; }
-  if (e.code === 'ArrowLeft')  { player.facing = -1; }
-  if (e.code === 'ArrowRight') { player.facing =  1; }
+addEventListener('mousedown',  e => { e.preventDefault(); inpDown(); });
+addEventListener('mouseup',    e => { e.preventDefault(); inpUp(); });
+addEventListener('touchstart',  e => { e.preventDefault(); inpDown(); }, {passive:false});
+addEventListener('touchend',    e => { e.preventDefault(); inpUp(); }, {passive:false});
+addEventListener('keydown', e => {
+  if (e.code === 'Space')      { e.preventDefault(); if (!e.repeat) inpDown(); }
+  if (e.code === 'ArrowLeft')  P.facing = -1;
+  if (e.code === 'ArrowRight') P.facing =  1;
+  if (e.code === 'KeyR')       restartLevel();
+  if (e.code === 'Space' && gameState !== 'playing') titleClick();
 });
-window.addEventListener('keyup', e => {
-  if (e.code === 'Space') {
-    let held = performance.now() / 1000 - inputDownTime;
-    inputDown = false;
-    inputJustUp = true;
-    if (held < TAP_THRESHOLD) { inputIsTap = true; }
-  }
-  if (e.code === 'KeyR') restartLevel();
+addEventListener('keyup', e => {
+  if (e.code === 'Space') inpUp();
 });
 
-// --- Game State ---
-let gameState = 'title'; // title, playing, rating, gameover
-let currentLevel = 0;
-let stats = { echoesSpawned: 0, echoesUsed: 0, shockwavesTriggered: 0, totalLandings: 0, wastedLandings: 0 };
-let ratingTimer = 0;
-let titlePulse = 0;
+function clearInp() { inp.down = false; inp.justUp = false; inp.tap = false; }
+
+// --- State ---
+let gameState = 'title';
+let curLevel = 0, ratingTimer = 0, titlePulse = 0;
+let stats, platforms, echoes, shockwaves, crystals, plates, timedPlates;
+let hazards, doors, goalZone, maxEcho, echoCharges;
+let particles = [], levelMsg = '', levelMsgT = 0;
+let cam = {x:0, y:0};
 
 // --- Player ---
-let player = {
-  x: 100, y: 300, vx: 0, vy: 0,
-  w: PLAYER_W, h: PLAYER_H,
-  grounded: false, charging: false,
-  chargeTime: 0, facing: 1,
-  lastJumpVx: 0, lastJumpVy: 0,
-  justLanded: false, wasGrounded: false,
-  dead: false, trailParticles: []
+let P = {
+  x:0, y:0, vx:0, vy:0, w:PW, h:PH,
+  grounded:false, charging:false, chargeT:0, facing:1,
+  lastJVx:0, lastJVy:0, justLanded:false, wasGnd:true,
+  dead:false, trail:[]
 };
 
-// --- Level Data ---
-let platforms = [];
-let echoes = [];
-let shockwaves = [];
-let crystals = [];
-let pressurePlates = [];
-let timedPlates = [];
-let hazards = [];
-let movingPlatforms = [];
-let doors = [];
-let goalZone = null;
-let maxEchoes = 5;
-let echoCharges = 5;
-let particles = [];
-let levelMessage = '';
-let levelMessageTimer = 0;
-
-// --- Particle System ---
-function spawnParticles(x, y, count, color, spread, life, speed) {
-  for (let i = 0; i < count; i++) {
-    let angle = Math.random() * Math.PI * 2;
-    let sp = (Math.random() * 0.5 + 0.5) * (speed || 120);
-    particles.push({
-      x, y, vx: Math.cos(angle) * sp * (spread || 1), vy: Math.sin(angle) * sp * (spread || 1),
-      life: (life || 0.6) * (0.5 + Math.random() * 0.5), maxLife: life || 0.6,
-      color: color || '#00ffff', size: 2 + Math.random() * 3
-    });
-  }
-}
-
-// --- Level Definitions ---
+// ==== LEVELS ====
 const LEVELS = [
-  // Level 1: Echo as platform
-  function() {
-    levelMessage = 'Level 1: Step on your echoes';
-    platforms = [
-      { x: 0, y: 520, w: 300, h: 40 },        // start
-      { x: 500, y: 520, w: 200, h: 40 },        // middle gap
-      { x: 900, y: 400, w: 200, h: 40 },        // higher platform
-      { x: 1300, y: 280, w: 200, h: 40 },       // even higher
-    ];
-    goalZone = { x: 1400, y: 220, w: 60, h: 60 };
-    player.x = 100; player.y = 502;
-    maxEchoes = 5; echoCharges = 5;
-    crystals = [{ x: 700, y: 460, collected: false }];
+  ()=>{
+    levelMsg='Level 1: Step on your echoes';
+    platforms=[{x:0,y:520,w:300,h:40},{x:500,y:520,w:200,h:40},{x:900,y:400,w:200,h:40},{x:1300,y:280,w:200,h:40}];
+    goalZone={x:1400,y:220,w:60,h:60};
+    P.x=100; P.y=520-PH/2;
+    maxEcho=5; echoCharges=5;
+    crystals=[{x:700,y:460,got:false}];
   },
-
-  // Level 2: Echo triggers pressure plate
-  function() {
-    levelMessage = 'Level 2: Your echoes can trigger plates';
-    platforms = [
-      { x: 0, y: 520, w: 350, h: 40 },
-      { x: 550, y: 520, w: 100, h: 40 },        // small platform over plate
-      { x: 850, y: 520, w: 300, h: 40 },
-    ];
-    pressurePlates = [
-      { x: 570, y: 510, w: 60, h: 12, activated: false, doorId: 0 }
-    ];
-    doors = [
-      { x: 830, y: 420, w: 30, h: 100, open: false, id: 0 }
-    ];
-    goalZone = { x: 1050, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 502;
-    maxEchoes = 5; echoCharges = 5;
-    crystals = [];
+  ()=>{
+    levelMsg='Level 2: Your echoes can trigger plates';
+    platforms=[{x:0,y:520,w:350,h:40},{x:550,y:520,w:100,h:40},{x:850,y:520,w:300,h:40}];
+    plates=[{x:570,y:510,w:60,h:12,on:false,door:0}];
+    doors=[{x:830,y:420,w:30,h:100,open:false,id:0}];
+    goalZone={x:1050,y:460,w:60,h:60};
+    P.x=100; P.y=520-PH/2;
+    maxEcho=5; echoCharges=5;
   },
-
-  // Level 3: Two echoes, two plates
-  function() {
-    levelMessage = 'Level 3: Plan your landing order';
-    platforms = [
-      { x: 0, y: 520, w: 300, h: 40 },
-      { x: 400, y: 480, w: 120, h: 40 },
-      { x: 650, y: 440, w: 120, h: 40 },
-      { x: 900, y: 520, w: 300, h: 40 },
-    ];
-    pressurePlates = [
-      { x: 420, y: 470, w: 60, h: 12, activated: false, doorId: 0 },
-      { x: 670, y: 430, w: 60, h: 12, activated: false, doorId: 1 }
-    ];
-    doors = [
-      { x: 880, y: 420, w: 30, h: 100, open: false, id: 0 },
-      { x: 910, y: 420, w: 30, h: 100, open: false, id: 1 }
-    ];
-    goalZone = { x: 1100, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 502;
-    maxEchoes = 5; echoCharges = 5;
-    crystals = [{ x: 560, y: 380, collected: false }];
+  ()=>{
+    levelMsg='Level 3: Plan your landing order';
+    platforms=[{x:0,y:520,w:300,h:40},{x:400,y:480,w:120,h:40},{x:650,y:440,w:120,h:40},{x:900,y:520,w:300,h:40}];
+    plates=[{x:420,y:470,w:60,h:12,on:false,door:0},{x:670,y:430,w:60,h:12,on:false,door:1}];
+    doors=[{x:880,y:420,w:30,h:100,open:false,id:0},{x:910,y:420,w:30,h:100,open:false,id:1}];
+    goalZone={x:1100,y:460,w:60,h:60};
+    P.x=100; P.y=520-PH/2;
+    maxEcho=5; echoCharges=5;
+    crystals=[{x:560,y:380,got:false}];
   },
-
-  // Level 4: Timed plate
-  function() {
-    levelMessage = 'Level 4: Time your echoes carefully';
-    platforms = [
-      { x: 0, y: 520, w: 300, h: 40 },
-      { x: 450, y: 480, w: 150, h: 40 },
-      { x: 800, y: 520, w: 300, h: 40 },
-    ];
-    timedPlates = [
-      { x: 480, y: 470, w: 60, h: 12, armed: false, completed: false, timer: 0, timeWindow: 2.5, doorId: 0, armOnLanding: true }
-    ];
-    doors = [
-      { x: 780, y: 420, w: 30, h: 100, open: false, id: 0 }
-    ];
-    goalZone = { x: 1000, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 502;
-    maxEchoes = 5; echoCharges = 5;
-    crystals = [];
+  ()=>{
+    levelMsg='Level 4: Time your echoes carefully';
+    platforms=[{x:0,y:520,w:300,h:40},{x:450,y:480,w:150,h:40},{x:800,y:520,w:300,h:40}];
+    timedPlates=[{x:480,y:470,w:60,h:12,armed:false,done:false,t:0,window:2.5,door:0,armOnLand:true}];
+    doors=[{x:780,y:420,w:30,h:100,open:false,id:0}];
+    goalZone={x:1000,y:460,w:60,h:60};
+    P.x=100; P.y=520-PH/2;
+    maxEcho=5; echoCharges=5;
   },
-
-  // Level 5: Limited echoes + moving hazard
-  function() {
-    levelMessage = 'Level 5: Farewell to past selves';
-    platforms = [
-      { x: 0, y: 520, w: 250, h: 40 },
-      { x: 400, y: 480, w: 100, h: 40 },
-      { x: 650, y: 420, w: 100, h: 40 },
-      { x: 900, y: 360, w: 100, h: 40 },
-      { x: 1150, y: 300, w: 200, h: 40 },
+  ()=>{
+    levelMsg='Level 5: Farewell to past selves';
+    platforms=[{x:0,y:520,w:250,h:40},{x:400,y:480,w:100,h:40},{x:650,y:420,w:100,h:40},{x:900,y:360,w:100,h:40},{x:1150,y:300,w:200,h:40}];
+    hazards=[
+      {x:350,y:490,w:40,h:20,moves:true,ax:300,ay:490,bx:600,by:490,sp:150,goB:true},
+      {x:850,y:380,w:40,h:20,moves:true,ax:800,ay:380,bx:1050,by:380,sp:180,goB:true}
     ];
-    hazards = [
-      { x: 350, y: 490, w: 40, h: 20, moves: true, ax: 300, ay: 490, bx: 600, by: 490, speed: 150, goingB: true },
-      { x: 850, y: 380, w: 40, h: 20, moves: true, ax: 800, ay: 380, bx: 1050, by: 380, speed: 180, goingB: true }
-    ];
-    goalZone = { x: 1250, y: 240, w: 60, h: 60 };
-    player.x = 100; player.y = 502;
-    maxEchoes = 3; echoCharges = 3;
-    crystals = [{ x: 750, y: 350, collected: false }];
+    goalZone={x:1250,y:240,w:60,h:60};
+    P.x=100; P.y=520-PH/2;
+    maxEcho=3; echoCharges=3;
+    crystals=[{x:750,y:350,got:false}];
   }
 ];
 
-// --- Load Level ---
-function loadLevel(idx) {
-  currentLevel = idx;
-  echoes = [];
-  shockwaves = [];
-  particles = [];
-  platforms = [];
-  crystals = [];
-  pressurePlates = [];
-  timedPlates = [];
-  hazards = [];
-  movingPlatforms = [];
-  doors = [];
-  goalZone = null;
-  stats = { echoesSpawned: 0, echoesUsed: 0, shockwavesTriggered: 0, totalLandings: 0, wastedLandings: 0 };
-  player.vx = 0; player.vy = 0;
-  player.grounded = false; player.charging = false;
-  player.chargeTime = 0; player.facing = 1;
-  player.dead = false; player.justLanded = false;
-  player.wasGrounded = true;   // start as grounded so first frame isn't a "landing"
-  player.lastJumpVx = 0; player.lastJumpVy = 0;
-  player.trailParticles = [];
-
-  if (idx < LEVELS.length) {
-    LEVELS[idx]();
-    levelMessageTimer = 3.0;
+function loadLevel(i) {
+  curLevel = i;
+  echoes=[]; shockwaves=[]; particles=[];
+  platforms=[]; crystals=[]; plates=[]; timedPlates=[];
+  hazards=[]; doors=[]; goalZone=null;
+  stats={spawned:0,used:0,shocks:0,lands:0,wasted:0};
+  P.vx=0; P.vy=0; P.grounded=false; P.charging=false;
+  P.chargeT=0; P.facing=1; P.dead=false;
+  P.justLanded=false; P.wasGnd=true;
+  P.lastJVx=0; P.lastJVy=0; P.trail=[];
+  if (i < LEVELS.length) {
+    LEVELS[i]();
+    levelMsgT = 3;
     gameState = 'playing';
-    // Clear any stale input from title/rating screen
-    inputDown = false;
-    inputJustUp = false;
-    inputIsTap = false;
+    clearInp();
+    ignoreUntil = performance.now() + 300;
   } else {
     gameState = 'gameover';
   }
 }
 
-function restartLevel() {
-  loadLevel(currentLevel);
+function restartLevel() { loadLevel(curLevel); }
+
+// ==== HELPERS ====
+function overlap(a,b) {
+  return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+}
+function prect() {
+  return {x:P.x-P.w/2, y:P.y-P.h/2, w:P.w, h:P.h};
+}
+function spawnP(x,y,n,col,sp,life,spd) {
+  for(let i=0;i<n;i++){
+    let a=Math.random()*Math.PI*2, s=(Math.random()*0.5+0.5)*(spd||120);
+    particles.push({x,y,vx:Math.cos(a)*s*(sp||1),vy:Math.sin(a)*s*(sp||1),
+      life:(life||0.6)*(0.5+Math.random()*0.5),ml:life||0.6,
+      col:col||'#00ffff',sz:2+Math.random()*3});
+  }
+}
+function openDoor(id) {
+  for(let d of doors) if(d.id===id){ d.open=true; spawnP(d.x+d.w/2,d.y+d.h/2,15,'#88ffaa',2,0.6,120); }
 }
 
-// --- Collision Helpers ---
-function rectOverlap(a, b) {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-}
-
-function pointInRect(px, py, r) {
-  return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
-}
-
-// --- Physics / Update ---
+// ==== PLAYER UPDATE ====
 function updatePlayer(dt) {
-  if (player.dead) return;
+  if (P.dead) return;
 
   // Gravity
-  if (!player.grounded) {
-    player.vy += GRAVITY * dt;
-  }
+  if (!P.grounded) P.vy += GRAVITY * dt;
 
-  // Friction / air resistance
-  if (player.grounded) {
-    // Strong ground friction — stop sliding
-    player.vx *= Math.pow(0.001, dt);
-    if (Math.abs(player.vx) < 1) player.vx = 0;
+  // Friction
+  if (P.grounded) {
+    P.vx *= Math.pow(0.0001, dt);
+    if (Math.abs(P.vx) < 0.5) P.vx = 0;
   } else {
-    // Air resistance
-    player.vx *= (1 - 0.5 * dt);
+    P.vx *= (1 - 0.5 * dt);
   }
 
-  player.x += player.vx * dt;
-  player.y += player.vy * dt;
+  // Move
+  P.x += P.vx * dt;
+  P.y += P.vy * dt;
 
-  // --- Collision resolution ---
-  let allSolids = [...platforms];
-  for (let d of doors) {
-    if (!d.open) allSolids.push(d);
+  // --- Collect solids ---
+  let solids = [...platforms];
+  for (let d of doors) if (!d.open) solids.push(d);
+
+  // --- Collision resolution (full solids) ---
+  for (let s of solids) {
+    let pr = prect();
+    if (!overlap(pr, s)) continue;
+    let ob = (pr.y+pr.h) - s.y;   // bottom
+    let ot = (s.y+s.h) - pr.y;    // top
+    let ol = (pr.x+pr.w) - s.x;   // left
+    let or2 = (s.x+s.w) - pr.x;   // right
+    let m = Math.min(ob,ot,ol,or2);
+    if (m === ob && P.vy >= 0) { P.y = s.y - P.h/2; P.vy = 0; }
+    else if (m === ot && P.vy < 0) { P.y = s.y + s.h + P.h/2; P.vy = 0; }
+    else if (m === ol) { P.x = s.x - P.w/2; P.vx = 0; }
+    else if (m === or2) { P.x = s.x + s.w + P.w/2; P.vx = 0; }
   }
 
-  // Echoes as one-way platforms (only solid from above, with spawn grace period)
-  let echoSolids = [];
+  // --- Echo one-way collision (top only, with grace) ---
   for (let e of echoes) {
-    if (!e.replaying || e.frozenAfterReplay) {
-      if (e.timer < 0.3) continue;
-      echoSolids.push({ x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H, isEcho: true, echoRef: e });
+    if (e.timer < 0.3) continue;
+    if (e.replaying && !e.frozen) continue;
+    let er = {x:e.x-EW/2, y:e.y-EH/2, w:EW, h:EH};
+    let pr = prect();
+    if (!overlap(pr, er)) continue;
+    let ob = (pr.y+pr.h) - er.y;
+    if (P.vy >= 0 && ob > 0 && ob < 20) {
+      P.y = er.y - P.h/2;
+      P.vy = 0;
+      e.playerOn = true;
     }
   }
 
-  // Resolve solid (full) collisions
-  for (let p of allSolids) {
-    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (!rectOverlap(pr, p)) continue;
+  // --- Ground check (skin-based, stable) ---
+  P.grounded = false;
+  let fL = P.x - P.w/2 + 2;
+  let fR = P.x + P.w/2 - 2;
+  let fY = P.y + P.h/2;
 
-    let overlapBottom = (pr.y + pr.h) - p.y;
-    let overlapTop = (p.y + p.h) - pr.y;
-    let overlapLeft = (pr.x + pr.w) - p.x;
-    let overlapRight = (p.x + p.w) - pr.x;
-    let minOverlap = Math.min(overlapBottom, overlapTop, overlapLeft, overlapRight);
-
-    if (minOverlap === overlapBottom && player.vy >= 0) {
-      player.y = p.y - player.h/2;
-      player.vy = 0;
-    } else if (minOverlap === overlapTop && player.vy < 0) {
-      player.y = p.y + p.h + player.h/2;
-      player.vy = 0;
-    } else if (minOverlap === overlapLeft) {
-      player.x = p.x - player.w/2;
-      player.vx = 0;
-    } else if (minOverlap === overlapRight) {
-      player.x = p.x + p.w + player.w/2;
-      player.vx = 0;
-    }
-  }
-
-  // Resolve one-way echo collisions (top only)
-  for (let p of echoSolids) {
-    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (!rectOverlap(pr, p)) continue;
-    let overlapBottom = (pr.y + pr.h) - p.y;
-    if (player.vy >= 0 && overlapBottom > 0 && overlapBottom < 20) {
-      player.y = p.y - player.h/2;
-      player.vy = 0;
-      if (p.isEcho) p.echoRef.playerOnTop = true;
-    }
-  }
-
-  // --- Ground check: cast a small ray downward from player feet ---
-  // This avoids the flickering problem from exact-edge overlap checks
-  player.grounded = false;
-  const skinY = 2; // pixels of tolerance
-  let feetX = player.x;
-  let feetY = player.y + player.h / 2;
-  let feetLeft = player.x - player.w / 2 + 2;
-  let feetRight = player.x + player.w / 2 - 2;
-
-  let groundables = [...allSolids, ...echoSolids];
-  for (let p of groundables) {
-    // Check if player feet are at/near the top surface of this platform
-    // and horizontally within the platform
-    if (feetRight > p.x && feetLeft < p.x + p.w) {
-      let surfaceY = p.y;
-      if (feetY >= surfaceY - skinY && feetY <= surfaceY + skinY && player.vy >= 0) {
-        player.y = surfaceY - player.h / 2;
-        player.grounded = true;
-        if (p.isEcho && p.echoRef) p.echoRef.playerOnTop = true;
+  // Check platforms + closed doors
+  for (let s of solids) {
+    if (fR > s.x && fL < s.x + s.w) {
+      if (fY >= s.y - SKIN && fY <= s.y + SKIN && P.vy >= 0) {
+        P.y = s.y - P.h/2;
+        P.grounded = true;
         break;
       }
     }
   }
-  }
-
-  // Landing detection
-  if (!player.wasGrounded && player.grounded) {
-    player.justLanded = true;
-    stats.totalLandings++;
-    spawnParticles(player.x, player.y + player.h/2, 6, '#aabbcc', 1.5, 0.4, 80);
-
-    // Arm timed plates on landing
-    for (let tp of timedPlates) {
-      if (tp.armOnLanding && !tp.completed) {
-        tp.armed = true;
-        tp.timer = 0;
+  // Check echo platforms
+  if (!P.grounded) {
+    for (let e of echoes) {
+      if (e.timer < 0.3) continue;
+      if (e.replaying && !e.frozen) continue;
+      let ey = e.y - EH/2;
+      let ex = e.x - EW/2;
+      if (fR > ex && fL < ex + EW) {
+        if (fY >= ey - SKIN && fY <= ey + SKIN && P.vy >= 0) {
+          P.y = ey - P.h/2;
+          P.grounded = true;
+          e.playerOn = true;
+          break;
+        }
       }
     }
-  } else {
-    player.justLanded = false;
-  }
-  player.wasGrounded = player.grounded;
-
-  // Ignore input during screen transition grace period
-  let inputBlocked = performance.now() < ignoreInputUntil;
-  if (inputBlocked) {
-    inputIsTap = false;
-    inputJustUp = false;
-    inputDown = false;
   }
 
-  // Tap to flip direction (quick press & release while grounded)
-  if (inputIsTap) {
-    if (player.grounded) {
-      player.facing *= -1;
-      spawnParticles(player.x, player.y, 3, '#88ddff', 0.5, 0.2, 40);
+  // --- Landing detection ---
+  if (!P.wasGnd && P.grounded) {
+    P.justLanded = true;
+    stats.lands++;
+    spawnP(P.x, P.y+P.h/2, 6, '#aabbcc', 1.5, 0.4, 80);
+    for (let tp of timedPlates) {
+      if (tp.armOnLand && !tp.done) { tp.armed = true; tp.t = 0; }
     }
-    inputIsTap = false;
+  } else {
+    P.justLanded = false;
+  }
+  P.wasGnd = P.grounded;
+
+  // --- Input (blocked during transition) ---
+  let blocked = performance.now() < ignoreUntil;
+  if (blocked) { clearInp(); return; /* skip all input processing */ }
+
+  // Tap → flip direction
+  if (inp.tap) {
+    if (P.grounded) {
+      P.facing *= -1;
+      spawnP(P.x, P.y, 3, '#88ddff', 0.5, 0.2, 40);
+    }
+    inp.tap = false;
   }
 
-  // Charging — starts immediately on press (grounded)
-  if (inputDown && player.grounded && !player.charging) {
-    player.charging = true;
-    player.chargeTime = 0;
+  // Charge
+  if (inp.down && P.grounded && !P.charging) {
+    P.charging = true;
+    P.chargeT = 0;
   }
-  if (player.charging) {
-    player.chargeTime += dt;
-    if (player.chargeTime > MAX_CHARGE_TIME) player.chargeTime = MAX_CHARGE_TIME;
+  if (P.charging) {
+    P.chargeT += dt;
+    if (P.chargeT > MAX_CHARGE) P.chargeT = MAX_CHARGE;
   }
-  if (inputJustUp && player.charging) {
-    // Jump!
-    let t = player.chargeTime / MAX_CHARGE_TIME;
+
+  // Jump on release
+  if (inp.justUp && P.charging) {
+    let t = P.chargeT / MAX_CHARGE;
     let force = MIN_JUMP + (MAX_JUMP - MIN_JUMP) * t;
-    let vx = Math.cos(JUMP_ANGLE) * force * player.facing;
-    let vy = -Math.sin(JUMP_ANGLE) * force;
-    player.vx = vx;
-    player.vy = vy;
-    player.grounded = false;
-    player.charging = false;
-    player.chargeTime = 0;
-    player.lastJumpVx = vx;
-    player.lastJumpVy = vy;
-    spawnParticles(player.x, player.y + player.h/2, 8, '#00ffff', 1, 0.3, 100);
-  }
-  // If released without charging (short tap handled above), just clear
-  if (inputJustUp && !player.charging) {
-    // nothing — tap already handled
+    P.vx = Math.cos(JUMP_ANGLE) * force * P.facing;
+    P.vy = -Math.sin(JUMP_ANGLE) * force;
+    P.grounded = false;
+    P.charging = false;
+    P.chargeT = 0;
+    P.lastJVx = P.vx;
+    P.lastJVy = P.vy;
+    spawnP(P.x, P.y+P.h/2, 8, '#00ffff', 1, 0.3, 100);
   }
 
-  // Echo side-touch boost (for moving echoes)
+  // Echo side-boost
   for (let e of echoes) {
-    if (e.replaying) {
-      let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-      let er = { x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H };
-      if (rectOverlap(pr, er)) {
-        let dx = player.x - e.x;
-        if (Math.abs(dx) > 5) {
-          let dir = dx > 0 ? 1 : -1;
-          player.vx += dir * ECHO_BOOST * dt * 3;
-          stats.echoesUsed++;
-          e.used = true;
-          spawnParticles(player.x, player.y, 4, '#ff00ff', 1, 0.3, 60);
-        }
+    if (!e.replaying) continue;
+    let er = {x:e.x-EW/2,y:e.y-EH/2,w:EW,h:EH};
+    if (overlap(prect(), er)) {
+      let dx = P.x - e.x;
+      if (Math.abs(dx) > 5) {
+        P.vx += (dx>0?1:-1) * ECHO_BOOST * dt * 3;
+        stats.used++; e.used = true;
+        spawnP(P.x, P.y, 4, '#ff00ff', 1, 0.3, 60);
       }
     }
   }
 
   // Crystals
   for (let c of crystals) {
-    if (c.collected) continue;
-    let dist = Math.hypot(player.x - c.x, player.y - c.y);
-    if (dist < 30) {
-      c.collected = true;
-      echoCharges = Math.min(echoCharges + 1, maxEchoes);
-      spawnParticles(c.x, c.y, 12, '#ffff00', 1.5, 0.6, 150);
+    if (c.got) continue;
+    if (Math.hypot(P.x-c.x, P.y-c.y) < 30) {
+      c.got = true;
+      echoCharges = Math.min(echoCharges+1, maxEcho);
+      spawnP(c.x, c.y, 12, '#ffff00', 1.5, 0.6, 150);
     }
   }
 
   // Pressure plates
-  for (let pp of pressurePlates) {
-    if (pp.activated) continue;
-    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (rectOverlap(pr, pp)) {
-      pp.activated = true;
-      openDoor(pp.doorId);
-      spawnParticles(pp.x + pp.w/2, pp.y, 8, '#00ff00', 1, 0.4, 80);
-    }
-    // Also check echoes on plates
+  for (let pp of plates) {
+    if (pp.on) continue;
+    if (overlap(prect(), pp)) { pp.on=true; openDoor(pp.door); spawnP(pp.x+pp.w/2,pp.y,8,'#00ff00',1,0.4,80); }
     for (let e of echoes) {
-      let er = { x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H };
-      if (rectOverlap(er, pp)) {
-        pp.activated = true;
-        openDoor(pp.doorId);
-        stats.echoesUsed++;
-        e.used = true;
-        spawnParticles(pp.x + pp.w/2, pp.y, 8, '#00ff00', 1, 0.4, 80);
-      }
+      let er={x:e.x-EW/2,y:e.y-EH/2,w:EW,h:EH};
+      if (overlap(er,pp)) { pp.on=true; openDoor(pp.door); stats.used++; e.used=true; spawnP(pp.x+pp.w/2,pp.y,8,'#00ff00',1,0.4,80); }
     }
   }
 
   // Timed plates
   for (let tp of timedPlates) {
-    if (tp.completed) continue;
+    if (tp.done) continue;
+    if (tp.armed) { tp.t += dt; if (tp.t >= tp.window) tp.armed = false; }
     if (tp.armed) {
-      tp.timer += dt;
-      if (tp.timer >= tp.timeWindow) {
-        tp.armed = false; // timeout
-      }
-    }
-    if (tp.armed) {
-      let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-      if (rectOverlap(pr, tp)) {
-        tp.completed = true; tp.armed = false;
-        openDoor(tp.doorId);
-        spawnParticles(tp.x + tp.w/2, tp.y, 10, '#00ff00', 1, 0.5, 100);
-      }
+      if (overlap(prect(), tp)) { tp.done=true; tp.armed=false; openDoor(tp.door); spawnP(tp.x+tp.w/2,tp.y,10,'#00ff00',1,0.5,100); }
       for (let e of echoes) {
-        let er = { x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H };
-        if (rectOverlap(er, tp)) {
-          tp.completed = true; tp.armed = false;
-          openDoor(tp.doorId);
-          stats.echoesUsed++;
-          e.used = true;
-          spawnParticles(tp.x + tp.w/2, tp.y, 10, '#00ff00', 1, 0.5, 100);
-        }
+        let er={x:e.x-EW/2,y:e.y-EH/2,w:EW,h:EH};
+        if (overlap(er,tp)) { tp.done=true; tp.armed=false; openDoor(tp.door); stats.used++; e.used=true; spawnP(tp.x+tp.w/2,tp.y,10,'#00ff00',1,0.5,100); }
       }
     }
   }
 
   // Hazards
   for (let h of hazards) {
-    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (rectOverlap(pr, h)) {
-      player.dead = true;
-      spawnParticles(player.x, player.y, 20, '#ff4444', 2, 0.8, 200);
+    if (overlap(prect(), h)) {
+      P.dead = true;
+      spawnP(P.x, P.y, 20, '#ff4444', 2, 0.8, 200);
       setTimeout(restartLevel, 1000);
       return;
     }
   }
 
   // Goal
-  if (goalZone) {
-    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (rectOverlap(pr, goalZone)) {
-      completeLevel();
-    }
+  if (goalZone && overlap(prect(), goalZone)) {
+    gameState = 'rating'; ratingTimer = 0;
+    spawnP(P.x, P.y, 30, '#ffdd00', 3, 1.0, 200);
   }
 
   // Fall death
-  if (player.y > 800) {
-    player.dead = true;
-    setTimeout(restartLevel, 500);
-  }
-
-  // Facing is now controlled by tap/arrows — no auto-flip from velocity
+  if (P.y > 800) { P.dead = true; setTimeout(restartLevel, 500); }
 
   // Trail
-  if (!player.grounded) {
-    player.trailParticles.push({
-      x: player.x, y: player.y, life: 0.3, maxLife: 0.3
-    });
-  }
-  player.trailParticles = player.trailParticles.filter(p => {
-    p.life -= dt;
-    return p.life > 0;
-  });
+  if (!P.grounded) P.trail.push({x:P.x, y:P.y, life:0.3, ml:0.3});
+  P.trail = P.trail.filter(t => { t.life -= dt; return t.life > 0; });
 }
 
-function openDoor(doorId) {
-  for (let d of doors) {
-    if (d.id === doorId) {
-      d.open = true;
-      spawnParticles(d.x + d.w/2, d.y + d.h/2, 15, '#88ffaa', 2, 0.6, 120);
-    }
-  }
-}
-
-// --- Echo Update ---
+// ==== ECHO UPDATE ====
 function updateEchoes(dt) {
-  // Spawn echo on landing
-  if (player.justLanded && echoCharges > 0 && (player.lastJumpVx !== 0 || player.lastJumpVy !== 0)) {
-    let echo = {
-      x: player.x, y: player.y,
-      vx: 0, vy: 0,
-      storedVx: player.lastJumpVx,
-      storedVy: player.lastJumpVy,
-      timer: 0, replaying: false,
-      hasReplayed: false, frozenAfterReplay: false,
-      lifetime: ECHO_LIFETIME, playerOnTop: false,
-      sinkOffset: 0, used: false, dead: false,
-      spawnAlpha: 0
-    };
-    echoes.push(echo);
+  if (P.justLanded && echoCharges > 0 && (P.lastJVx !== 0 || P.lastJVy !== 0)) {
+    echoes.push({
+      x:P.x, y:P.y, vx:0, vy:0,
+      svx:P.lastJVx, svy:P.lastJVy,
+      timer:0, replaying:false, hasReplayed:false, frozen:false,
+      playerOn:false, sink:0, used:false, dead:false, alpha:0
+    });
     echoCharges--;
-    stats.echoesSpawned++;
-    spawnParticles(echo.x, echo.y, 6, '#00aaff55', 1, 0.4, 60);
+    stats.spawned++;
+    spawnP(P.x, P.y, 6, '#00aaff55', 1, 0.4, 60);
   }
 
-  for (let i = echoes.length - 1; i >= 0; i--) {
+  for (let i = echoes.length-1; i >= 0; i--) {
     let e = echoes[i];
     e.timer += dt;
-    e.spawnAlpha = Math.min(e.spawnAlpha + dt * 3, 1);
+    e.alpha = Math.min(e.alpha + dt*3, 1);
 
-    // Sink when player on top
-    if (e.playerOnTop && !e.replaying) {
-      e.y += ECHO_SINK_SPEED * dt;
-      e.sinkOffset += ECHO_SINK_SPEED * dt;
+    if (e.playerOn && !e.replaying) {
+      e.y += ECHO_SINK * dt;
+      e.sink += ECHO_SINK * dt;
     }
-    e.playerOnTop = false;
+    e.playerOn = false;
 
-    // Replay
-    if (!e.hasReplayed && e.timer >= ECHO_REPLAY_DELAY) {
+    if (!e.hasReplayed && e.timer >= ECHO_DELAY) {
       e.hasReplayed = true;
       e.replaying = true;
-      e.vx = e.storedVx;
-      e.vy = e.storedVy;
-      spawnParticles(e.x, e.y, 8, '#00ffff88', 1.2, 0.3, 80);
+      e.vx = e.svx; e.vy = e.svy;
+      spawnP(e.x, e.y, 8, '#00ffff88', 1.2, 0.3, 80);
     }
 
-    // Physics during replay
-    if (e.replaying && !e.frozenAfterReplay) {
+    if (e.replaying && !e.frozen) {
       e.vy += GRAVITY * dt;
       e.x += e.vx * dt;
       e.y += e.vy * dt;
-
-      // Land on platforms
       for (let p of platforms) {
-        let er = { x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H };
-        if (rectOverlap(er, p)) {
-          let overlapBottom = (er.y + er.h) - p.y;
-          if (overlapBottom > 0 && overlapBottom < 20 && e.vy > 0) {
-            e.y = p.y - ECHO_H/2;
-            e.vy = 0;
-            e.vx = 0;
-            e.replaying = false;
-            e.frozenAfterReplay = true;
+        let er = {x:e.x-EW/2,y:e.y-EH/2,w:EW,h:EH};
+        if (overlap(er, p)) {
+          let ob = (er.y+er.h) - p.y;
+          if (ob > 0 && ob < 20 && e.vy > 0) {
+            e.y = p.y - EH/2; e.vy=0; e.vx=0;
+            e.replaying = false; e.frozen = true;
           }
         }
       }
-
-      // Freeze after 2s of replaying
-      if (e.timer >= ECHO_REPLAY_DELAY + 2.0) {
-        e.replaying = false;
-        e.frozenAfterReplay = true;
-        e.vx = 0;
-        e.vy = 0;
+      if (e.timer >= ECHO_DELAY + 2.0) {
+        e.replaying=false; e.frozen=true; e.vx=0; e.vy=0;
       }
     }
 
-    // Echo-echo collision → shockwave
-    for (let j = i - 1; j >= 0; j--) {
+    for (let j = i-1; j >= 0; j--) {
       let e2 = echoes[j];
       if (e.dead || e2.dead) continue;
-      let dist = Math.hypot(e.x - e2.x, e.y - e2.y);
-      if (dist < ECHO_W && (e.replaying || e2.replaying)) {
-        let mx = (e.x + e2.x) / 2;
-        let my = (e.y + e2.y) / 2;
-        shockwaves.push({ x: mx, y: my, timer: 0, radius: 0 });
-        stats.shockwavesTriggered++;
-        stats.echoesUsed += 2;
-        e.dead = true;
-        e2.dead = true;
-        spawnParticles(mx, my, 20, '#ff00ff', 2, 0.6, 200);
-        spawnParticles(mx, my, 15, '#ffffff', 1.5, 0.4, 160);
+      if (Math.hypot(e.x-e2.x, e.y-e2.y) < EW && (e.replaying || e2.replaying)) {
+        let mx=(e.x+e2.x)/2, my=(e.y+e2.y)/2;
+        shockwaves.push({x:mx,y:my,t:0,r:0});
+        stats.shocks++; stats.used+=2;
+        e.dead=true; e2.dead=true;
+        spawnP(mx,my,20,'#ff00ff',2,0.6,200);
+        spawnP(mx,my,15,'#ffffff',1.5,0.4,160);
       }
     }
 
-    // Lifetime
-    if (e.timer >= e.lifetime || e.dead || e.y > 800) {
-      echoes.splice(i, 1);
-    }
+    if (e.timer >= ECHO_LIFE || e.dead || e.y > 800) echoes.splice(i, 1);
   }
 }
 
-// --- Shockwave Update ---
 function updateShockwaves(dt) {
-  for (let i = shockwaves.length - 1; i >= 0; i--) {
+  for (let i = shockwaves.length-1; i >= 0; i--) {
     let s = shockwaves[i];
-    s.timer += dt;
-    s.radius = (s.timer / SHOCKWAVE_DURATION) * SHOCKWAVE_RADIUS;
-
-    // Launch player if nearby
-    let dist = Math.hypot(player.x - s.x, player.y - s.y);
-    if (dist < s.radius && s.timer < 0.15) {
-      player.vy = -SHOCKWAVE_LAUNCH;
-      player.grounded = false;
+    s.t += dt;
+    s.r = (s.t / SW_DUR) * SW_RADIUS;
+    if (Math.hypot(P.x-s.x, P.y-s.y) < s.r && s.t < 0.15) {
+      P.vy = -SW_LAUNCH; P.grounded = false;
     }
-
-    if (s.timer >= SHOCKWAVE_DURATION) {
-      shockwaves.splice(i, 1);
-    }
+    if (s.t >= SW_DUR) shockwaves.splice(i, 1);
   }
 }
 
-// --- Hazard Update ---
 function updateHazards(dt) {
   for (let h of hazards) {
     if (!h.moves) continue;
-    let tx = h.goingB ? h.bx : h.ax;
-    let ty = h.goingB ? h.by : h.ay;
-    let dx = tx - h.x;
-    let dy = ty - h.y;
-    let dist = Math.hypot(dx, dy);
-    if (dist < 2) {
-      h.goingB = !h.goingB;
-    } else {
-      h.x += (dx / dist) * h.speed * dt;
-      h.y += (dy / dist) * h.speed * dt;
-    }
+    let tx=h.goB?h.bx:h.ax, ty=h.goB?h.by:h.ay;
+    let dx=tx-h.x, dy=ty-h.y, d=Math.hypot(dx,dy);
+    if (d<2) h.goB=!h.goB;
+    else { h.x+=dx/d*h.sp*dt; h.y+=dy/d*h.sp*dt; }
   }
 }
 
-// --- Particles Update ---
 function updateParticles(dt) {
-  for (let i = particles.length - 1; i >= 0; i--) {
-    let p = particles[i];
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    p.vy += 300 * dt;
-    p.life -= dt;
-    if (p.life <= 0) particles.splice(i, 1);
+  for (let i=particles.length-1;i>=0;i--) {
+    let p=particles[i];
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=300*dt;
+    p.life-=dt;
+    if (p.life<=0) particles.splice(i,1);
   }
 }
 
-// --- Rating ---
-function calculateGrade() {
-  let utilization = stats.echoesSpawned > 0 ? stats.echoesUsed / stats.echoesSpawned : 0;
-  let sw = stats.shockwavesTriggered;
-  let wasted = stats.wastedLandings;
-  if (utilization >= 0.8 && sw >= 2 && wasted === 0) return 'S';
-  if (utilization >= 0.6 && sw >= 1) return 'A';
-  if (utilization >= 0.4) return 'B';
-  if (stats.totalLandings > 0) return 'C';
+function updateCamera(dt) {
+  let tx=P.x-canvas.width/2, ty=P.y-canvas.height/2-50;
+  cam.x+=(tx-cam.x)*4*dt; cam.y+=(ty-cam.y)*4*dt;
+}
+
+function calcGrade() {
+  let u = stats.spawned>0 ? stats.used/stats.spawned : 0;
+  if (u>=0.8 && stats.shocks>=2 && stats.wasted===0) return 'S';
+  if (u>=0.6 && stats.shocks>=1) return 'A';
+  if (u>=0.4) return 'B';
+  if (stats.lands>0) return 'C';
   return 'D';
 }
 
-function completeLevel() {
-  gameState = 'rating';
-  ratingTimer = 0;
-  spawnParticles(player.x, player.y, 30, '#ffdd00', 3, 1.0, 200);
-}
-
-// --- Camera ---
-let cam = { x: 0, y: 0 };
-function updateCamera(dt) {
-  let tx = player.x - canvas.width / 2;
-  let ty = player.y - canvas.height / 2 - 50;
-  cam.x += (tx - cam.x) * 4 * dt;
-  cam.y += (ty - cam.y) * 4 * dt;
-}
-
-// --- Draw ---
+// ==== DRAWING ====
 function drawGame() {
   ctx.save();
   ctx.translate(-cam.x, -cam.y);
 
-  // Background grid
-  let gx = Math.floor(cam.x / 60) * 60;
-  let gy = Math.floor(cam.y / 60) * 60;
-  ctx.strokeStyle = '#151520';
-  ctx.lineWidth = 1;
-  for (let x = gx; x < cam.x + canvas.width + 60; x += 60) {
-    ctx.beginPath(); ctx.moveTo(x, cam.y); ctx.lineTo(x, cam.y + canvas.height); ctx.stroke();
-  }
-  for (let y = gy; y < cam.y + canvas.height + 60; y += 60) {
-    ctx.beginPath(); ctx.moveTo(cam.x, y); ctx.lineTo(cam.x + canvas.width, y); ctx.stroke();
-  }
+  // Grid
+  let gx=Math.floor(cam.x/60)*60, gy=Math.floor(cam.y/60)*60;
+  ctx.strokeStyle='#151520'; ctx.lineWidth=1;
+  for(let x=gx;x<cam.x+canvas.width+60;x+=60){ctx.beginPath();ctx.moveTo(x,cam.y);ctx.lineTo(x,cam.y+canvas.height);ctx.stroke();}
+  for(let y=gy;y<cam.y+canvas.height+60;y+=60){ctx.beginPath();ctx.moveTo(cam.x,y);ctx.lineTo(cam.x+canvas.width,y);ctx.stroke();}
 
   // Platforms
-  for (let p of platforms) {
-    let grad = ctx.createLinearGradient(p.x, p.y, p.x, p.y + p.h);
-    grad.addColorStop(0, '#334455');
-    grad.addColorStop(1, '#1a2233');
-    ctx.fillStyle = grad;
-    ctx.fillRect(p.x, p.y, p.w, p.h);
-    ctx.strokeStyle = '#4488aa44';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(p.x, p.y, p.w, p.h);
-    // Top edge glow
-    ctx.strokeStyle = '#5599bb88';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x + p.w, p.y); ctx.stroke();
+  for(let p of platforms){
+    let g=ctx.createLinearGradient(p.x,p.y,p.x,p.y+p.h);
+    g.addColorStop(0,'#334455'); g.addColorStop(1,'#1a2233');
+    ctx.fillStyle=g; ctx.fillRect(p.x,p.y,p.w,p.h);
+    ctx.strokeStyle='#5599bb88'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+p.w,p.y); ctx.stroke();
   }
 
   // Doors
-  for (let d of doors) {
-    if (d.open) continue;
-    ctx.fillStyle = '#664422';
-    ctx.fillRect(d.x, d.y, d.w, d.h);
-    ctx.strokeStyle = '#886633';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(d.x, d.y, d.w, d.h);
-    // Lock icon
-    ctx.fillStyle = '#ffaa33';
-    ctx.fillRect(d.x + d.w/2 - 4, d.y + d.h/2 - 4, 8, 8);
+  for(let d of doors){
+    if(d.open) continue;
+    ctx.fillStyle='#664422'; ctx.fillRect(d.x,d.y,d.w,d.h);
+    ctx.strokeStyle='#886633'; ctx.lineWidth=2; ctx.strokeRect(d.x,d.y,d.w,d.h);
+    ctx.fillStyle='#ffaa33'; ctx.fillRect(d.x+d.w/2-4,d.y+d.h/2-4,8,8);
   }
 
   // Pressure plates
-  for (let pp of pressurePlates) {
-    ctx.fillStyle = pp.activated ? '#00ff66' : '#666666';
-    ctx.fillRect(pp.x, pp.y, pp.w, pp.h);
-    if (pp.activated) {
-      ctx.shadowColor = '#00ff66';
-      ctx.shadowBlur = 10;
-      ctx.fillRect(pp.x, pp.y, pp.w, pp.h);
-      ctx.shadowBlur = 0;
-    }
+  for(let pp of plates){
+    ctx.fillStyle=pp.on?'#00ff66':'#666'; ctx.fillRect(pp.x,pp.y,pp.w,pp.h);
   }
 
   // Timed plates
-  for (let tp of timedPlates) {
-    let col = '#666666';
-    if (tp.completed) col = '#00ff66';
-    else if (tp.armed) {
-      let frac = 1 - tp.timer / tp.timeWindow;
-      col = `rgb(${Math.floor(255*(1-frac))}, ${Math.floor(255*frac)}, 0)`;
-    }
-    ctx.fillStyle = col;
-    ctx.fillRect(tp.x, tp.y, tp.w, tp.h);
-    if (tp.armed && !tp.completed) {
-      // Timer bar
-      let frac = 1 - tp.timer / tp.timeWindow;
-      ctx.fillStyle = '#ffffff44';
-      ctx.fillRect(tp.x, tp.y - 6, tp.w * frac, 4);
-    }
+  for(let tp of timedPlates){
+    let c='#666';
+    if(tp.done)c='#00ff66';
+    else if(tp.armed){let f=1-tp.t/tp.window; c=`rgb(${255*(1-f)|0},${255*f|0},0)`;}
+    ctx.fillStyle=c; ctx.fillRect(tp.x,tp.y,tp.w,tp.h);
+    if(tp.armed&&!tp.done){ctx.fillStyle='#fff4';ctx.fillRect(tp.x,tp.y-6,tp.w*(1-tp.t/tp.window),4);}
   }
 
   // Hazards
-  for (let h of hazards) {
-    ctx.fillStyle = '#ff3333';
-    ctx.fillRect(h.x, h.y, h.w, h.h);
-    ctx.shadowColor = '#ff0000';
-    ctx.shadowBlur = 8;
-    ctx.fillRect(h.x, h.y, h.w, h.h);
-    ctx.shadowBlur = 0;
-    // Danger marks
-    ctx.fillStyle = '#ffff00';
-    ctx.font = '12px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('⚡', h.x + h.w/2, h.y - 4);
+  for(let h of hazards){
+    ctx.fillStyle='#ff3333'; ctx.fillRect(h.x,h.y,h.w,h.h);
+    ctx.shadowColor='#f00'; ctx.shadowBlur=8; ctx.fillRect(h.x,h.y,h.w,h.h); ctx.shadowBlur=0;
+    ctx.fillStyle='#ff0'; ctx.font='12px monospace'; ctx.textAlign='center';
+    ctx.fillText('⚡',h.x+h.w/2,h.y-4);
   }
 
   // Crystals
-  for (let c of crystals) {
-    if (c.collected) continue;
-    let pulse = Math.sin(Date.now() / 200) * 0.3 + 0.7;
-    ctx.save();
-    ctx.translate(c.x, c.y);
-    ctx.rotate(Date.now() / 1000);
-    ctx.fillStyle = `rgba(255, 255, 100, ${pulse})`;
-    ctx.beginPath();
-    ctx.moveTo(0, -12);
-    ctx.lineTo(8, 0);
-    ctx.lineTo(0, 12);
-    ctx.lineTo(-8, 0);
-    ctx.closePath();
-    ctx.fill();
-    ctx.shadowColor = '#ffff00';
-    ctx.shadowBlur = 15;
-    ctx.fill();
-    ctx.shadowBlur = 0;
+  for(let c of crystals){
+    if(c.got) continue;
+    let pulse=Math.sin(Date.now()/200)*0.3+0.7;
+    ctx.save(); ctx.translate(c.x,c.y); ctx.rotate(Date.now()/1000);
+    ctx.fillStyle=`rgba(255,255,100,${pulse})`;
+    ctx.beginPath(); ctx.moveTo(0,-12); ctx.lineTo(8,0); ctx.lineTo(0,12); ctx.lineTo(-8,0); ctx.closePath();
+    ctx.fill(); ctx.shadowColor='#ff0'; ctx.shadowBlur=15; ctx.fill(); ctx.shadowBlur=0;
     ctx.restore();
   }
 
   // Echoes
-  for (let e of echoes) {
-    let alpha = 0.35 * e.spawnAlpha;
-    if (e.replaying) alpha = 0.6;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    // Glow
-    ctx.shadowColor = '#00ccff';
-    ctx.shadowBlur = 12;
-    // Body
-    ctx.fillStyle = '#00ccff';
-    ctx.fillRect(e.x - ECHO_W/2, e.y - ECHO_H/2, ECHO_W, ECHO_H);
-    // Eyes
-    ctx.fillStyle = '#ffffff88';
-    ctx.fillRect(e.x - 6, e.y - ECHO_H/4, 4, 4);
-    ctx.fillRect(e.x + 2, e.y - ECHO_H/4, 4, 4);
-    ctx.shadowBlur = 0;
-    ctx.globalAlpha = 1;
-    ctx.restore();
-
-    // Timer ring
-    if (!e.hasReplayed) {
-      let frac = e.timer / ECHO_REPLAY_DELAY;
-      ctx.strokeStyle = '#00ffff88';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(e.x, e.y - ECHO_H/2 - 8, 6, -Math.PI/2, -Math.PI/2 + frac * Math.PI * 2);
-      ctx.stroke();
+  for(let e of echoes){
+    let a=0.35*e.alpha; if(e.replaying)a=0.6;
+    ctx.save(); ctx.globalAlpha=a;
+    ctx.shadowColor='#0cf'; ctx.shadowBlur=12;
+    ctx.fillStyle='#0cf'; ctx.fillRect(e.x-EW/2,e.y-EH/2,EW,EH);
+    ctx.fillStyle='#fff8'; ctx.fillRect(e.x-6,e.y-EH/4,4,4); ctx.fillRect(e.x+2,e.y-EH/4,4,4);
+    ctx.shadowBlur=0; ctx.globalAlpha=1; ctx.restore();
+    if(!e.hasReplayed){
+      let f=e.timer/ECHO_DELAY;
+      ctx.strokeStyle='#0ff8'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(e.x,e.y-EH/2-8,6,-Math.PI/2,-Math.PI/2+f*Math.PI*2); ctx.stroke();
     }
   }
 
   // Shockwaves
-  for (let s of shockwaves) {
-    let alpha = 1 - s.timer / SHOCKWAVE_DURATION;
-    ctx.strokeStyle = `rgba(255, 0, 255, ${alpha})`;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, s.radius, 0, Math.PI * 2);
-    ctx.stroke();
-    // Inner ring
-    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.5})`;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, s.radius * 0.6, 0, Math.PI * 2);
-    ctx.stroke();
+  for(let s of shockwaves){
+    let a=1-s.t/SW_DUR;
+    ctx.strokeStyle=`rgba(255,0,255,${a})`; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.stroke();
   }
 
   // Goal
-  if (goalZone) {
-    let pulse = Math.sin(Date.now() / 300) * 0.2 + 0.6;
-    ctx.fillStyle = `rgba(255, 215, 0, ${pulse * 0.3})`;
-    ctx.fillRect(goalZone.x, goalZone.y, goalZone.w, goalZone.h);
-    ctx.strokeStyle = `rgba(255, 215, 0, ${pulse})`;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(goalZone.x, goalZone.y, goalZone.w, goalZone.h);
-    // Arrow
-    ctx.fillStyle = `rgba(255, 215, 0, ${pulse})`;
-    ctx.font = '20px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('▽', goalZone.x + goalZone.w/2, goalZone.y - 8 + Math.sin(Date.now()/400) * 4);
+  if(goalZone){
+    let pulse=Math.sin(Date.now()/300)*0.2+0.6;
+    ctx.fillStyle=`rgba(255,215,0,${pulse*0.3})`; ctx.fillRect(goalZone.x,goalZone.y,goalZone.w,goalZone.h);
+    ctx.strokeStyle=`rgba(255,215,0,${pulse})`; ctx.lineWidth=2; ctx.strokeRect(goalZone.x,goalZone.y,goalZone.w,goalZone.h);
+    ctx.fillStyle=`rgba(255,215,0,${pulse})`; ctx.font='20px monospace'; ctx.textAlign='center';
+    ctx.fillText('▽',goalZone.x+goalZone.w/2,goalZone.y-8+Math.sin(Date.now()/400)*4);
   }
 
   // Player trail
-  for (let t of player.trailParticles) {
-    let a = t.life / t.maxLife * 0.4;
-    ctx.fillStyle = `rgba(0, 200, 255, ${a})`;
-    ctx.fillRect(t.x - 4, t.y - 4, 8, 8);
-  }
+  for(let t of P.trail){let a=t.life/t.ml*0.4;ctx.fillStyle=`rgba(0,200,255,${a})`;ctx.fillRect(t.x-4,t.y-4,8,8);}
 
   // Player
-  if (!player.dead) {
-    ctx.save();
-    ctx.translate(player.x, player.y);
-    ctx.scale(player.facing, 1);
+  if(!P.dead){
+    ctx.save(); ctx.translate(P.x,P.y); ctx.scale(P.facing,1);
+    let bc=P.charging?'#fa0':'#0df';
+    ctx.fillStyle=bc; ctx.shadowColor=bc; ctx.shadowBlur=P.charging?20:8;
+    ctx.fillRect(-P.w/2,-P.h/2,P.w,P.h);
+    ctx.shadowBlur=0;
+    ctx.fillStyle='#fff'; ctx.fillRect(-7,-P.h/4-1,5,5); ctx.fillRect(2,-P.h/4-1,5,5);
+    ctx.fillStyle='#112'; ctx.fillRect(-5,-P.h/4,2,3); ctx.fillRect(4,-P.h/4,2,3);
 
-    // Body
-    let bodyColor = player.charging ? '#ffaa00' : '#00ddff';
-    ctx.fillStyle = bodyColor;
-    ctx.shadowColor = bodyColor;
-    ctx.shadowBlur = player.charging ? 20 : 8;
-    ctx.fillRect(-player.w/2, -player.h/2, player.w, player.h);
-
-    // Eyes
-    ctx.shadowBlur = 0;
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(-7, -player.h/4 - 1, 5, 5);
-    ctx.fillRect(2, -player.h/4 - 1, 5, 5);
-    // Pupils
-    ctx.fillStyle = '#111122';
-    ctx.fillRect(-5, -player.h/4, 2, 3);
-    ctx.fillRect(4, -player.h/4, 2, 3);
-
-    // Direction arrow indicator (always visible when grounded)
-    if (player.grounded && !player.charging) {
-      ctx.fillStyle = '#00ffff88';
-      ctx.beginPath();
-      let ax = player.facing * 20;
-      ctx.moveTo(ax, -4);
-      ctx.lineTo(ax + player.facing * 8, 0);
-      ctx.lineTo(ax, 4);
-      ctx.closePath();
-      ctx.fill();
+    // Direction arrow
+    if(P.grounded&&!P.charging){
+      ctx.fillStyle='#0ff8'; ctx.beginPath();
+      let ax=20; ctx.moveTo(ax,-4); ctx.lineTo(ax+8,0); ctx.lineTo(ax,4); ctx.closePath(); ctx.fill();
     }
 
-    // Charge indicator
-    if (player.charging) {
-      let t = player.chargeTime / MAX_CHARGE_TIME;
-      ctx.strokeStyle = `rgba(255, 170, 0, ${0.5 + t * 0.5})`;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(0, 0, player.w/2 + 6, 0, Math.PI * 2 * t);
-      ctx.stroke();
-
-      // Charge particles
-      if (Math.random() < t) {
-        let angle = Math.random() * Math.PI * 2;
-        let r = player.w/2 + 8;
-        spawnParticles(
-          player.x + Math.cos(angle) * r,
-          player.y + Math.sin(angle) * r,
-          1, '#ffcc00', 0.3, 0.2, 30
-        );
-      }
+    // Charge ring
+    if(P.charging){
+      let t=P.chargeT/MAX_CHARGE;
+      ctx.strokeStyle=`rgba(255,170,0,${0.5+t*0.5})`; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(0,0,P.w/2+6,0,Math.PI*2*t); ctx.stroke();
     }
-
     ctx.restore();
   }
 
   // Particles
-  for (let p of particles) {
-    let a = p.life / p.maxLife;
-    ctx.globalAlpha = a;
-    ctx.fillStyle = p.color;
-    ctx.fillRect(p.x - p.size/2, p.y - p.size/2, p.size, p.size);
+  for(let p of particles){
+    ctx.globalAlpha=p.life/p.ml; ctx.fillStyle=p.col;
+    ctx.fillRect(p.x-p.sz/2,p.y-p.sz/2,p.sz,p.sz);
   }
-  ctx.globalAlpha = 1;
-
+  ctx.globalAlpha=1;
   ctx.restore();
 
-  // --- HUD (screen space) ---
-
-  // Echo charge dots
-  let dotSize = 12;
-  let dotGap = 8;
-  let dotsX = 20;
-  let dotsY = 20;
-  for (let i = 0; i < maxEchoes; i++) {
-    ctx.beginPath();
-    ctx.arc(dotsX + i * (dotSize + dotGap) + dotSize/2, dotsY + dotSize/2, dotSize/2, 0, Math.PI * 2);
-    if (i < echoCharges) {
-      ctx.fillStyle = '#00ffff';
-      ctx.shadowColor = '#00ffff';
-      ctx.shadowBlur = 8;
-    } else {
-      ctx.fillStyle = '#333344';
-      ctx.shadowBlur = 0;
-    }
-    ctx.fill();
-    ctx.shadowBlur = 0;
+  // --- HUD ---
+  let ds=12,dg=8,dx=20,dy=20;
+  for(let i=0;i<maxEcho;i++){
+    ctx.beginPath(); ctx.arc(dx+i*(ds+dg)+ds/2,dy+ds/2,ds/2,0,Math.PI*2);
+    if(i<echoCharges){ctx.fillStyle='#0ff';ctx.shadowColor='#0ff';ctx.shadowBlur=8;}
+    else{ctx.fillStyle='#334';ctx.shadowBlur=0;}
+    ctx.fill(); ctx.shadowBlur=0;
   }
 
-  // Charge bar
-  if (player.charging) {
-    let barW = 80, barH = 8;
-    let barX = canvas.width/2 - barW/2;
-    let barY = canvas.height - 60;
-    let t = player.chargeTime / MAX_CHARGE_TIME;
-    ctx.fillStyle = '#222233';
-    ctx.fillRect(barX, barY, barW, barH);
-    let r = Math.floor(255 * t);
-    let g = Math.floor(255 * (1 - t * 0.5));
-    ctx.fillStyle = `rgb(${r}, ${g}, 50)`;
-    ctx.fillRect(barX, barY, barW * t, barH);
-    ctx.strokeStyle = '#4466aa';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(barX, barY, barW, barH);
+  if(P.charging){
+    let bw=80,bh=8,bx=canvas.width/2-bw/2,by=canvas.height-60;
+    let t=P.chargeT/MAX_CHARGE;
+    ctx.fillStyle='#223'; ctx.fillRect(bx,by,bw,bh);
+    ctx.fillStyle=`rgb(${255*t|0},${255*(1-t*0.5)|0},50)`; ctx.fillRect(bx,by,bw*t,bh);
+    ctx.strokeStyle='#46a'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,bh);
   }
 
-  // Level message
-  if (levelMessageTimer > 0) {
-    let alpha = Math.min(levelMessageTimer, 1);
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '18px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(levelMessage, canvas.width/2, 70);
-    ctx.globalAlpha = 1;
+  if(levelMsgT>0){
+    ctx.globalAlpha=Math.min(levelMsgT,1); ctx.fillStyle='#fff'; ctx.font='18px monospace'; ctx.textAlign='center';
+    ctx.fillText(levelMsg,canvas.width/2,70); ctx.globalAlpha=1;
   }
 
-  // Level number
-  ctx.fillStyle = '#ffffff44';
-  ctx.font = '12px monospace';
-  ctx.textAlign = 'right';
-  ctx.fillText(`Level ${currentLevel + 1}/5`, canvas.width - 15, 25);
-  ctx.fillText('[R] Restart', canvas.width - 15, 42);
+  ctx.fillStyle='#fff4'; ctx.font='12px monospace'; ctx.textAlign='right';
+  ctx.fillText(`Level ${curLevel+1}/5`,canvas.width-15,25);
+  ctx.fillText('[R] Restart',canvas.width-15,42);
 
-  // Controls hint
-  if (currentLevel === 0 && levelMessageTimer > 0) {
-    ctx.fillStyle = '#ffffff66';
-    ctx.font = '14px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('TAP to flip direction — HOLD to charge — RELEASE to jump', canvas.width/2, canvas.height - 30);
-    ctx.fillStyle = '#ffffff44';
-    ctx.font = '12px monospace';
-    ctx.fillText('(or use ← → arrow keys to aim)', canvas.width/2, canvas.height - 12);
+  if(curLevel===0&&levelMsgT>0){
+    ctx.fillStyle='#fff6'; ctx.font='14px monospace'; ctx.textAlign='center';
+    ctx.fillText('TAP to flip — HOLD to charge — RELEASE to jump',canvas.width/2,canvas.height-30);
+    ctx.fillStyle='#fff4'; ctx.font='12px monospace';
+    ctx.fillText('(← → arrow keys also work)',canvas.width/2,canvas.height-12);
   }
 }
 
 function drawTitle() {
-  titlePulse += 0.02;
-  ctx.fillStyle = '#0a0a0f';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  titlePulse+=0.02;
+  ctx.fillStyle='#0a0a0f'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle='#112'; ctx.lineWidth=1;
+  for(let x=0;x<canvas.width;x+=60){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,canvas.height);ctx.stroke();}
+  for(let y=0;y<canvas.height;y+=60){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(canvas.width,y);ctx.stroke();}
 
-  // Grid bg
-  ctx.strokeStyle = '#111122';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < canvas.width; x += 60) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
-  }
-  for (let y = 0; y < canvas.height; y += 60) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
-  }
+  let glow=Math.sin(titlePulse)*0.3+0.7;
+  ctx.save(); ctx.shadowColor='#0cf'; ctx.shadowBlur=30*glow;
+  ctx.fillStyle=`rgba(0,220,255,${glow})`; ctx.font='bold 60px monospace'; ctx.textAlign='center';
+  ctx.fillText('ECHO STEP',canvas.width/2,canvas.height/2-60);
+  ctx.shadowBlur=0; ctx.restore();
 
-  // Title
-  let glow = Math.sin(titlePulse) * 0.3 + 0.7;
-  ctx.save();
-  ctx.shadowColor = '#00ccff';
-  ctx.shadowBlur = 30 * glow;
-  ctx.fillStyle = `rgba(0, 220, 255, ${glow})`;
-  ctx.font = 'bold 60px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('ECHO STEP', canvas.width/2, canvas.height/2 - 60);
-  ctx.shadowBlur = 0;
-  ctx.restore();
+  ctx.fillStyle='#fff6'; ctx.font='16px monospace'; ctx.textAlign='center';
+  ctx.fillText('One button. Every step answers.',canvas.width/2,canvas.height/2-15);
+  ctx.fillStyle='#fff3'; ctx.font='12px monospace';
+  ctx.fillText('"You cannot move forward until you learn to use your past selves as tools."',canvas.width/2,canvas.height/2+20);
 
-  // Subtitle
-  ctx.fillStyle = '#ffffff66';
-  ctx.font = '16px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('One button. Every step answers.', canvas.width/2, canvas.height/2 - 15);
-
-  // Tagline
-  ctx.fillStyle = '#ffffff33';
-  ctx.font = '12px monospace';
-  ctx.fillText('"You cannot move forward until you learn to use your past selves as tools."', canvas.width/2, canvas.height/2 + 20);
-
-  // Start prompt
-  let blink = Math.sin(Date.now() / 400) > 0;
-  if (blink) {
-    ctx.fillStyle = '#00ffff';
-    ctx.font = '20px monospace';
-    ctx.fillText('[ CLICK / TAP / SPACE TO START ]', canvas.width/2, canvas.height/2 + 80);
+  if(Math.sin(Date.now()/400)>0){
+    ctx.fillStyle='#0ff'; ctx.font='20px monospace';
+    ctx.fillText('[ CLICK / TAP / SPACE ]',canvas.width/2,canvas.height/2+80);
   }
 
-  // Decorative echo character
-  let echoY = canvas.height/2 + 150 + Math.sin(Date.now()/500) * 10;
-  ctx.globalAlpha = 0.3;
-  ctx.fillStyle = '#00ccff';
-  ctx.fillRect(canvas.width/2 - 14, echoY - 18, 28, 36);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(canvas.width/2 - 7, echoY - 9, 5, 5);
-  ctx.fillRect(canvas.width/2 + 2, echoY - 9, 5, 5);
-  ctx.globalAlpha = 1;
+  let ey=canvas.height/2+150+Math.sin(Date.now()/500)*10;
+  ctx.globalAlpha=0.3; ctx.fillStyle='#0cf'; ctx.fillRect(canvas.width/2-14,ey-18,28,36);
+  ctx.fillStyle='#fff'; ctx.fillRect(canvas.width/2-7,ey-9,5,5); ctx.fillRect(canvas.width/2+2,ey-9,5,5);
+  ctx.globalAlpha=1;
 }
 
 function drawRating() {
-  ratingTimer += 0.016;
-  // Dim overlay
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  let grade = calculateGrade();
-  let gradeColors = { 'S': '#ffdd00', 'A': '#00ff88', 'B': '#00ccff', 'C': '#aaaaaa', 'D': '#ff4444' };
-
-  // Grade
-  if (ratingTimer > 0.3) {
-    let scale = Math.min((ratingTimer - 0.3) * 4, 1);
-    ctx.save();
-    ctx.translate(canvas.width/2, canvas.height/2 - 60);
-    ctx.scale(scale, scale);
-    ctx.shadowColor = gradeColors[grade] || '#ffffff';
-    ctx.shadowBlur = 30;
-    ctx.fillStyle = gradeColors[grade] || '#ffffff';
-    ctx.font = 'bold 100px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(grade, 0, 0);
-    ctx.shadowBlur = 0;
-    ctx.restore();
+  ratingTimer+=0.016;
+  ctx.fillStyle='rgba(0,0,0,0.7)'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  let grade=calcGrade();
+  let gc={'S':'#fd0','A':'#0f8','B':'#0cf','C':'#aaa','D':'#f44'};
+  if(ratingTimer>0.3){
+    let sc=Math.min((ratingTimer-0.3)*4,1);
+    ctx.save(); ctx.translate(canvas.width/2,canvas.height/2-60); ctx.scale(sc,sc);
+    ctx.shadowColor=gc[grade]||'#fff'; ctx.shadowBlur=30;
+    ctx.fillStyle=gc[grade]||'#fff'; ctx.font='bold 100px monospace'; ctx.textAlign='center';
+    ctx.fillText(grade,0,0); ctx.shadowBlur=0; ctx.restore();
   }
-
-  // Stats
-  if (ratingTimer > 0.8) {
-    ctx.fillStyle = '#ffffffbb';
-    ctx.font = '16px monospace';
-    ctx.textAlign = 'center';
-    let y = canvas.height/2 + 10;
-    ctx.fillText(`Echoes: ${stats.echoesUsed}/${stats.echoesSpawned}`, canvas.width/2, y);
-    ctx.fillText(`Shockwaves: ${stats.shockwavesTriggered}`, canvas.width/2, y + 25);
-    ctx.fillText(`Landings: ${stats.totalLandings}`, canvas.width/2, y + 50);
+  if(ratingTimer>0.8){
+    ctx.fillStyle='#fffb'; ctx.font='16px monospace'; ctx.textAlign='center';
+    let y=canvas.height/2+10;
+    ctx.fillText(`Echoes: ${stats.used}/${stats.spawned}`,canvas.width/2,y);
+    ctx.fillText(`Shockwaves: ${stats.shocks}`,canvas.width/2,y+25);
+    ctx.fillText(`Landings: ${stats.lands}`,canvas.width/2,y+50);
   }
-
-  // Continue
-  if (ratingTimer > 2.0) {
-    let blink = Math.sin(Date.now() / 400) > 0;
-    if (blink) {
-      ctx.fillStyle = '#ffffff88';
-      ctx.font = '14px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('[ CLICK TO CONTINUE ]', canvas.width/2, canvas.height/2 + 120);
-    }
+  if(ratingTimer>2&&Math.sin(Date.now()/400)>0){
+    ctx.fillStyle='#fff8'; ctx.font='14px monospace'; ctx.textAlign='center';
+    ctx.fillText('[ CLICK TO CONTINUE ]',canvas.width/2,canvas.height/2+120);
   }
 }
 
 function drawGameOver() {
-  ctx.fillStyle = '#0a0a0f';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  ctx.fillStyle = '#ffdd00';
-  ctx.font = 'bold 50px monospace';
-  ctx.textAlign = 'center';
-  ctx.shadowColor = '#ffdd00';
-  ctx.shadowBlur = 20;
-  ctx.fillText('THE END', canvas.width/2, canvas.height/2 - 40);
-  ctx.shadowBlur = 0;
-
-  ctx.fillStyle = '#ffffff88';
-  ctx.font = '16px monospace';
-  ctx.fillText('You have learned to walk with your echoes.', canvas.width/2, canvas.height/2 + 10);
-  ctx.fillText('Every step answered.', canvas.width/2, canvas.height/2 + 35);
-
-  let blink = Math.sin(Date.now() / 400) > 0;
-  if (blink) {
-    ctx.fillStyle = '#00ffff88';
-    ctx.font = '14px monospace';
-    ctx.fillText('[ CLICK TO PLAY AGAIN ]', canvas.width/2, canvas.height/2 + 90);
+  ctx.fillStyle='#0a0a0f'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle='#fd0'; ctx.font='bold 50px monospace'; ctx.textAlign='center';
+  ctx.shadowColor='#fd0'; ctx.shadowBlur=20;
+  ctx.fillText('THE END',canvas.width/2,canvas.height/2-40); ctx.shadowBlur=0;
+  ctx.fillStyle='#fff8'; ctx.font='16px monospace';
+  ctx.fillText('You have learned to walk with your echoes.',canvas.width/2,canvas.height/2+10);
+  ctx.fillText('Every step answered.',canvas.width/2,canvas.height/2+35);
+  if(Math.sin(Date.now()/400)>0){
+    ctx.fillStyle='#0ff8'; ctx.font='14px monospace';
+    ctx.fillText('[ CLICK TO PLAY AGAIN ]',canvas.width/2,canvas.height/2+90);
   }
 }
 
-// --- Title/Rating click handlers ---
-let ignoreInputUntil = 0;  // timestamp — ignore gameplay input until this time
-
-function handleTitleClick() {
-  if (gameState === 'title') {
-    loadLevel(0);
-    ignoreInputUntil = performance.now() + 300; // ignore input for 300ms after transition
-  } else if (gameState === 'rating' && ratingTimer > 2.0) {
-    loadLevel(currentLevel + 1);
-    ignoreInputUntil = performance.now() + 300;
-  } else if (gameState === 'gameover') {
-    loadLevel(0);
-    ignoreInputUntil = performance.now() + 300;
-    gameState = 'title';
-  }
+// --- Screen transition ---
+function titleClick() {
+  if(gameState==='title') loadLevel(0);
+  else if(gameState==='rating'&&ratingTimer>2) loadLevel(curLevel+1);
+  else if(gameState==='gameover'){ gameState='title'; }
 }
-
-window.addEventListener('click', e => {
-  if (gameState !== 'playing') handleTitleClick();
-});
-window.addEventListener('touchstart', e => {
-  if (gameState !== 'playing') handleTitleClick();
-}, { passive: true });
-window.addEventListener('keydown', e => {
-  if (e.code === 'Space' && gameState !== 'playing') handleTitleClick();
-});
+addEventListener('click', ()=>{ if(gameState!=='playing') titleClick(); });
+addEventListener('touchend', ()=>{ if(gameState!=='playing') titleClick(); }, {passive:true});
 
 // --- Main Loop ---
-let lastTime = performance.now();
+let lastT = performance.now();
+function loop(now) {
+  let dt = Math.min((now-lastT)/1000, 0.05);
+  lastT = now;
 
-function gameLoop(now) {
-  let dt = Math.min((now - lastTime) / 1000, 0.05);
-  lastTime = now;
+  ctx.fillStyle='#0a0a0f'; ctx.fillRect(0,0,canvas.width,canvas.height);
 
-  ctx.fillStyle = '#0a0a0f';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-  if (gameState === 'title') {
-    drawTitle();
-  } else if (gameState === 'playing') {
+  if(gameState==='title') drawTitle();
+  else if(gameState==='playing'){
     updatePlayer(dt);
     updateEchoes(dt);
     updateShockwaves(dt);
     updateHazards(dt);
     updateParticles(dt);
     updateCamera(dt);
-    if (levelMessageTimer > 0) levelMessageTimer -= dt;
+    if(levelMsgT>0) levelMsgT-=dt;
     drawGame();
-  } else if (gameState === 'rating') {
-    updateParticles(dt);
-    updateCamera(dt);
-    drawGame();
-    drawRating();
-  } else if (gameState === 'gameover') {
-    drawGameOver();
-  }
+  } else if(gameState==='rating'){
+    updateParticles(dt); updateCamera(dt);
+    drawGame(); drawRating();
+  } else if(gameState==='gameover') drawGameOver();
 
-  inputJustUp = false;
-  inputIsTap = false;
-  requestAnimationFrame(gameLoop);
+  inp.justUp = false;
+  inp.tap = false;
+  requestAnimationFrame(loop);
 }
-
-requestAnimationFrame(gameLoop);
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
