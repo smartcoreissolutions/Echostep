@@ -62,16 +62,39 @@ resize();
 // --- Input ---
 let inputDown = false;
 let inputJustUp = false;
+let inputDownTime = 0;        // timestamp when button went down
+const TAP_THRESHOLD = 0.15;   // seconds — shorter than this = tap to flip direction
+let inputIsTap = false;       // set on release if hold was short
 
-function onDown(e) { e.preventDefault(); inputDown = true; }
-function onUp(e) { e.preventDefault(); inputDown = false; inputJustUp = true; }
+function onDown(e) { e.preventDefault(); inputDown = true; inputDownTime = performance.now() / 1000; }
+function onUp(e) {
+  e.preventDefault();
+  let held = performance.now() / 1000 - inputDownTime;
+  inputDown = false;
+  if (held < TAP_THRESHOLD) {
+    inputIsTap = true;   // will be consumed in update
+  } else {
+    inputJustUp = true;  // charge-release jump
+  }
+}
 
 window.addEventListener('mousedown', onDown);
 window.addEventListener('mouseup', onUp);
 window.addEventListener('touchstart', onDown, { passive: false });
 window.addEventListener('touchend', onUp, { passive: false });
-window.addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); inputDown = true; } });
-window.addEventListener('keyup', e => { if (e.code === 'Space') { inputDown = false; inputJustUp = true; } if (e.code === 'KeyR') restartLevel(); });
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); inputDown = true; inputDownTime = performance.now() / 1000; }
+  if (e.code === 'ArrowLeft')  { player.facing = -1; }
+  if (e.code === 'ArrowRight') { player.facing =  1; }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') {
+    let held = performance.now() / 1000 - inputDownTime;
+    inputDown = false;
+    if (held < TAP_THRESHOLD) { inputIsTap = true; } else { inputJustUp = true; }
+  }
+  if (e.code === 'KeyR') restartLevel();
+});
 
 // --- Game State ---
 let gameState = 'title'; // title, playing, rating, gameover
@@ -350,10 +373,22 @@ function updatePlayer(dt) {
   }
   player.wasGrounded = player.grounded;
 
-  // Charging
+  // Tap to flip direction (quick press & release while grounded)
+  if (inputIsTap && player.grounded) {
+    player.facing *= -1;
+    spawnParticles(player.x, player.y, 3, '#88ddff', 0.5, 0.2, 40);
+    inputIsTap = false;
+  } else {
+    inputIsTap = false;
+  }
+
+  // Charging (only starts after held past tap threshold)
   if (inputDown && player.grounded && !player.charging) {
-    player.charging = true;
-    player.chargeTime = 0;
+    let held = performance.now() / 1000 - inputDownTime;
+    if (held >= TAP_THRESHOLD) {
+      player.charging = true;
+      player.chargeTime = held;  // count from press start
+    }
   }
   if (player.charging) {
     player.chargeTime += dt;
@@ -480,10 +515,7 @@ function updatePlayer(dt) {
     setTimeout(restartLevel, 500);
   }
 
-  // Facing based on velocity
-  if (Math.abs(player.vx) > 10) {
-    player.facing = player.vx > 0 ? 1 : -1;
-  }
+  // Facing is now controlled by tap/arrows — no auto-flip from velocity
 
   // Trail
   if (!player.grounded) {
@@ -885,6 +917,18 @@ function drawGame() {
     ctx.fillRect(-5, -player.h/4, 2, 3);
     ctx.fillRect(4, -player.h/4, 2, 3);
 
+    // Direction arrow indicator (always visible when grounded)
+    if (player.grounded && !player.charging) {
+      ctx.fillStyle = '#00ffff88';
+      ctx.beginPath();
+      let ax = player.facing * 20;
+      ctx.moveTo(ax, -4);
+      ctx.lineTo(ax + player.facing * 8, 0);
+      ctx.lineTo(ax, 4);
+      ctx.closePath();
+      ctx.fill();
+    }
+
     // Charge indicator
     if (player.charging) {
       let t = player.chargeTime / MAX_CHARGE_TIME;
@@ -982,7 +1026,10 @@ function drawGame() {
     ctx.fillStyle = '#ffffff66';
     ctx.font = '14px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('Hold SPACE / CLICK to charge — Release to jump', canvas.width/2, canvas.height - 30);
+    ctx.fillText('TAP to flip direction — HOLD to charge — RELEASE to jump', canvas.width/2, canvas.height - 30);
+    ctx.fillStyle = '#ffffff44';
+    ctx.font = '12px monospace';
+    ctx.fillText('(or use ← → arrow keys to aim)', canvas.width/2, canvas.height - 12);
   }
 }
 
@@ -1169,6 +1216,7 @@ function gameLoop(now) {
   }
 
   inputJustUp = false;
+  inputIsTap = false;
   requestAnimationFrame(gameLoop);
 }
 
