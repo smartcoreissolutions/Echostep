@@ -393,6 +393,14 @@ function updatePlayer(dt) {
   }
   player.wasGrounded = player.grounded;
 
+  // Ignore input during screen transition grace period
+  let inputBlocked = performance.now() < ignoreInputUntil;
+  if (inputBlocked) {
+    inputIsTap = false;
+    inputJustUp = false;
+    inputDown = false;
+  }
+
   // Tap to flip direction (quick press & release while grounded)
   if (inputIsTap) {
     if (player.grounded) {
@@ -1190,13 +1198,18 @@ function drawGameOver() {
 }
 
 // --- Title/Rating click handlers ---
+let ignoreInputUntil = 0;  // timestamp — ignore gameplay input until this time
+
 function handleTitleClick() {
   if (gameState === 'title') {
     loadLevel(0);
+    ignoreInputUntil = performance.now() + 300; // ignore input for 300ms after transition
   } else if (gameState === 'rating' && ratingTimer > 2.0) {
     loadLevel(currentLevel + 1);
+    ignoreInputUntil = performance.now() + 300;
   } else if (gameState === 'gameover') {
     loadLevel(0);
+    ignoreInputUntil = performance.now() + 300;
     gameState = 'title';
   }
 }
