@@ -306,7 +306,7 @@ function updatePlayer(dt) {
   // Friction / air resistance
   if (player.grounded) {
     // Strong ground friction — stop sliding
-    player.vx *= Math.pow(0.001, dt);  // essentially zeroes out in a couple frames
+    player.vx *= Math.pow(0.001, dt);
     if (Math.abs(player.vx) < 1) player.vx = 0;
   } else {
     // Air resistance
@@ -316,63 +316,82 @@ function updatePlayer(dt) {
   player.x += player.vx * dt;
   player.y += player.vy * dt;
 
-  // Ground check against platforms + closed doors
-  player.grounded = false;
+  // --- Collision resolution ---
   let allSolids = [...platforms];
-  // Closed doors as solids
   for (let d of doors) {
     if (!d.open) allSolids.push(d);
   }
+
   // Echoes as one-way platforms (only solid from above, with spawn grace period)
+  let echoSolids = [];
   for (let e of echoes) {
     if (!e.replaying || e.frozenAfterReplay) {
-      // Skip echoes that just spawned (grace period to avoid pushing player)
       if (e.timer < 0.3) continue;
-      allSolids.push({ x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H, isEcho: true, echoRef: e, oneWay: true });
+      echoSolids.push({ x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H, isEcho: true, echoRef: e });
     }
   }
 
+  // Resolve solid (full) collisions
   for (let p of allSolids) {
     let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
-    if (rectOverlap(pr, p)) {
-      // Resolve collision
-      let overlapBottom = (pr.y + pr.h) - p.y;
-      let overlapTop = (p.y + p.h) - pr.y;
-      let overlapLeft = (pr.x + pr.w) - p.x;
-      let overlapRight = (p.x + p.w) - pr.x;
+    if (!rectOverlap(pr, p)) continue;
 
-      let minOverlap = Math.min(overlapBottom, overlapTop, overlapLeft, overlapRight);
+    let overlapBottom = (pr.y + pr.h) - p.y;
+    let overlapTop = (p.y + p.h) - pr.y;
+    let overlapLeft = (pr.x + pr.w) - p.x;
+    let overlapRight = (p.x + p.w) - pr.x;
+    let minOverlap = Math.min(overlapBottom, overlapTop, overlapLeft, overlapRight);
 
-      // One-way platforms (echoes): only collide from above
-      if (p.oneWay) {
-        if (player.vy > 0 && overlapBottom > 0 && overlapBottom < 20) {
-          player.y = p.y - player.h/2;
-          player.vy = 0;
-          player.grounded = true;
-          if (p.isEcho) p.echoRef.playerOnTop = true;
-        }
-        continue; // skip all other collision directions for one-way
-      }
+    if (minOverlap === overlapBottom && player.vy >= 0) {
+      player.y = p.y - player.h/2;
+      player.vy = 0;
+    } else if (minOverlap === overlapTop && player.vy < 0) {
+      player.y = p.y + p.h + player.h/2;
+      player.vy = 0;
+    } else if (minOverlap === overlapLeft) {
+      player.x = p.x - player.w/2;
+      player.vx = 0;
+    } else if (minOverlap === overlapRight) {
+      player.x = p.x + p.w + player.w/2;
+      player.vx = 0;
+    }
+  }
 
-      if (minOverlap === overlapBottom && player.vy > 0) {
-        // Landing on top
-        player.y = p.y - player.h/2;
-        player.vy = 0;
+  // Resolve one-way echo collisions (top only)
+  for (let p of echoSolids) {
+    let pr = { x: player.x - player.w/2, y: player.y - player.h/2, w: player.w, h: player.h };
+    if (!rectOverlap(pr, p)) continue;
+    let overlapBottom = (pr.y + pr.h) - p.y;
+    if (player.vy >= 0 && overlapBottom > 0 && overlapBottom < 20) {
+      player.y = p.y - player.h/2;
+      player.vy = 0;
+      if (p.isEcho) p.echoRef.playerOnTop = true;
+    }
+  }
+
+  // --- Ground check: cast a small ray downward from player feet ---
+  // This avoids the flickering problem from exact-edge overlap checks
+  player.grounded = false;
+  const skinY = 2; // pixels of tolerance
+  let feetX = player.x;
+  let feetY = player.y + player.h / 2;
+  let feetLeft = player.x - player.w / 2 + 2;
+  let feetRight = player.x + player.w / 2 - 2;
+
+  let groundables = [...allSolids, ...echoSolids];
+  for (let p of groundables) {
+    // Check if player feet are at/near the top surface of this platform
+    // and horizontally within the platform
+    if (feetRight > p.x && feetLeft < p.x + p.w) {
+      let surfaceY = p.y;
+      if (feetY >= surfaceY - skinY && feetY <= surfaceY + skinY && player.vy >= 0) {
+        player.y = surfaceY - player.h / 2;
         player.grounded = true;
-        if (p.isEcho) {
-          p.echoRef.playerOnTop = true;
-        }
-      } else if (minOverlap === overlapTop && player.vy < 0) {
-        player.y = p.y + p.h + player.h/2;
-        player.vy = 0;
-      } else if (minOverlap === overlapLeft) {
-        player.x = p.x - player.w/2;
-        player.vx = 0;
-      } else if (minOverlap === overlapRight) {
-        player.x = p.x + p.w + player.w/2;
-        player.vx = 0;
+        if (p.isEcho && p.echoRef) p.echoRef.playerOnTop = true;
+        break;
       }
     }
+  }
   }
 
   // Landing detection
@@ -413,11 +432,6 @@ function updatePlayer(dt) {
   // Charging — starts immediately on press (grounded)
   if (inputDown && player.grounded && !player.charging) {
     player.charging = true;
-    player.chargeTime = 0;
-  }
-  // Cancel charge if we left the ground without releasing (e.g. slid off edge)
-  if (player.charging && !player.grounded && inputDown) {
-    player.charging = false;
     player.chargeTime = 0;
   }
   if (player.charging) {
