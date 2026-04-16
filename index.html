@@ -665,6 +665,8 @@ function drawGame() {
   ctx.fillStyle='#fff4'; ctx.font='12px monospace'; ctx.textAlign='right';
   ctx.fillText(`Level ${curLevel+1}/5`,canvas.width-15,25);
   ctx.fillText('[R] Restart',canvas.width-15,42);
+  ctx.fillStyle='#f008'; ctx.textAlign='left';
+  ctx.fillText('BUILD v7 — 2026-04-16 08:30',10,canvas.height-8);
 
   if(curLevel===0&&levelMsgT>0){
     ctx.fillStyle='#fff6'; ctx.font='14px monospace'; ctx.textAlign='center';
