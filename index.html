@@ -156,7 +156,7 @@ const LEVELS = [
       { x: 1300, y: 280, w: 200, h: 40 },       // even higher
     ];
     goalZone = { x: 1400, y: 220, w: 60, h: 60 };
-    player.x = 100; player.y = 470;
+    player.x = 100; player.y = 502;
     maxEchoes = 5; echoCharges = 5;
     crystals = [{ x: 700, y: 460, collected: false }];
   },
@@ -176,7 +176,7 @@ const LEVELS = [
       { x: 830, y: 420, w: 30, h: 100, open: false, id: 0 }
     ];
     goalZone = { x: 1050, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 470;
+    player.x = 100; player.y = 502;
     maxEchoes = 5; echoCharges = 5;
     crystals = [];
   },
@@ -199,7 +199,7 @@ const LEVELS = [
       { x: 910, y: 420, w: 30, h: 100, open: false, id: 1 }
     ];
     goalZone = { x: 1100, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 470;
+    player.x = 100; player.y = 502;
     maxEchoes = 5; echoCharges = 5;
     crystals = [{ x: 560, y: 380, collected: false }];
   },
@@ -219,7 +219,7 @@ const LEVELS = [
       { x: 780, y: 420, w: 30, h: 100, open: false, id: 0 }
     ];
     goalZone = { x: 1000, y: 460, w: 60, h: 60 };
-    player.x = 100; player.y = 470;
+    player.x = 100; player.y = 502;
     maxEchoes = 5; echoCharges = 5;
     crystals = [];
   },
@@ -239,7 +239,7 @@ const LEVELS = [
       { x: 850, y: 380, w: 40, h: 20, moves: true, ax: 800, ay: 380, bx: 1050, by: 380, speed: 180, goingB: true }
     ];
     goalZone = { x: 1250, y: 240, w: 60, h: 60 };
-    player.x = 100; player.y = 470;
+    player.x = 100; player.y = 502;
     maxEchoes = 3; echoCharges = 3;
     crystals = [{ x: 750, y: 350, collected: false }];
   }
@@ -264,7 +264,8 @@ function loadLevel(idx) {
   player.grounded = false; player.charging = false;
   player.chargeTime = 0; player.facing = 1;
   player.dead = false; player.justLanded = false;
-  player.wasGrounded = false;
+  player.wasGrounded = true;   // start as grounded so first frame isn't a "landing"
+  player.lastJumpVx = 0; player.lastJumpVy = 0;
   player.trailParticles = [];
 
   if (idx < LEVELS.length) {
@@ -322,10 +323,12 @@ function updatePlayer(dt) {
   for (let d of doors) {
     if (!d.open) allSolids.push(d);
   }
-  // Echoes as platforms
+  // Echoes as one-way platforms (only solid from above, with spawn grace period)
   for (let e of echoes) {
     if (!e.replaying || e.frozenAfterReplay) {
-      allSolids.push({ x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H, isEcho: true, echoRef: e });
+      // Skip echoes that just spawned (grace period to avoid pushing player)
+      if (e.timer < 0.3) continue;
+      allSolids.push({ x: e.x - ECHO_W/2, y: e.y - ECHO_H/2, w: ECHO_W, h: ECHO_H, isEcho: true, echoRef: e, oneWay: true });
     }
   }
 
@@ -339,6 +342,17 @@ function updatePlayer(dt) {
       let overlapRight = (p.x + p.w) - pr.x;
 
       let minOverlap = Math.min(overlapBottom, overlapTop, overlapLeft, overlapRight);
+
+      // One-way platforms (echoes): only collide from above
+      if (p.oneWay) {
+        if (player.vy > 0 && overlapBottom > 0 && overlapBottom < 20) {
+          player.y = p.y - player.h/2;
+          player.vy = 0;
+          player.grounded = true;
+          if (p.isEcho) p.echoRef.playerOnTop = true;
+        }
+        continue; // skip all other collision directions for one-way
+      }
 
       if (minOverlap === overlapBottom && player.vy > 0) {
         // Landing on top
