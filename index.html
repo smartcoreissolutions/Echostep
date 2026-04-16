@@ -71,10 +71,9 @@ function onUp(e) {
   e.preventDefault();
   let held = performance.now() / 1000 - inputDownTime;
   inputDown = false;
+  inputJustUp = true;  // always set — update loop decides if it's a tap or jump
   if (held < TAP_THRESHOLD) {
-    inputIsTap = true;   // will be consumed in update
-  } else {
-    inputJustUp = true;  // charge-release jump
+    inputIsTap = true;
   }
 }
 
@@ -91,7 +90,8 @@ window.addEventListener('keyup', e => {
   if (e.code === 'Space') {
     let held = performance.now() / 1000 - inputDownTime;
     inputDown = false;
-    if (held < TAP_THRESHOLD) { inputIsTap = true; } else { inputJustUp = true; }
+    inputJustUp = true;
+    if (held < TAP_THRESHOLD) { inputIsTap = true; }
   }
   if (e.code === 'KeyR') restartLevel();
 });
@@ -271,6 +271,10 @@ function loadLevel(idx) {
     LEVELS[idx]();
     levelMessageTimer = 3.0;
     gameState = 'playing';
+    // Clear any stale input from title/rating screen
+    inputDown = false;
+    inputJustUp = false;
+    inputIsTap = false;
   } else {
     gameState = 'gameover';
   }
@@ -298,9 +302,13 @@ function updatePlayer(dt) {
     player.vy += GRAVITY * dt;
   }
 
-  // Move
-  // Air resistance
-  if (!player.grounded) {
+  // Friction / air resistance
+  if (player.grounded) {
+    // Strong ground friction — stop sliding
+    player.vx *= Math.pow(0.001, dt);  // essentially zeroes out in a couple frames
+    if (Math.abs(player.vx) < 1) player.vx = 0;
+  } else {
+    // Air resistance
     player.vx *= (1 - 0.5 * dt);
   }
 
@@ -346,11 +354,9 @@ function updatePlayer(dt) {
       } else if (minOverlap === overlapLeft) {
         player.x = p.x - player.w/2;
         player.vx = 0;
-        player.facing = -1;
       } else if (minOverlap === overlapRight) {
         player.x = p.x + p.w + player.w/2;
         player.vx = 0;
-        player.facing = 1;
       }
     }
   }
@@ -374,21 +380,23 @@ function updatePlayer(dt) {
   player.wasGrounded = player.grounded;
 
   // Tap to flip direction (quick press & release while grounded)
-  if (inputIsTap && player.grounded) {
-    player.facing *= -1;
-    spawnParticles(player.x, player.y, 3, '#88ddff', 0.5, 0.2, 40);
-    inputIsTap = false;
-  } else {
+  if (inputIsTap) {
+    if (player.grounded) {
+      player.facing *= -1;
+      spawnParticles(player.x, player.y, 3, '#88ddff', 0.5, 0.2, 40);
+    }
     inputIsTap = false;
   }
 
-  // Charging (only starts after held past tap threshold)
+  // Charging — starts immediately on press (grounded)
   if (inputDown && player.grounded && !player.charging) {
-    let held = performance.now() / 1000 - inputDownTime;
-    if (held >= TAP_THRESHOLD) {
-      player.charging = true;
-      player.chargeTime = held;  // count from press start
-    }
+    player.charging = true;
+    player.chargeTime = 0;
+  }
+  // Cancel charge if we left the ground without releasing (e.g. slid off edge)
+  if (player.charging && !player.grounded && inputDown) {
+    player.charging = false;
+    player.chargeTime = 0;
   }
   if (player.charging) {
     player.chargeTime += dt;
@@ -408,6 +416,10 @@ function updatePlayer(dt) {
     player.lastJumpVx = vx;
     player.lastJumpVy = vy;
     spawnParticles(player.x, player.y + player.h/2, 8, '#00ffff', 1, 0.3, 100);
+  }
+  // If released without charging (short tap handled above), just clear
+  if (inputJustUp && !player.charging) {
+    // nothing — tap already handled
   }
 
   // Echo side-touch boost (for moving echoes)
